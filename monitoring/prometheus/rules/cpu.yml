@@ -1,0 +1,26 @@
+groups:
+  - name: app_cpu
+    rules:
+      - alert: HighCPUApp
+        expr: |
+          sum by (container_label_service) (
+            rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[2m])
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU for app"
+          description: "CPU usage > 50% for 2m"
+
+      - alert: LowCPUApp
+        expr: |
+          sum by (container_label_service) (
+            rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[5m])
+          ) < 0.2
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Low CPU for app"
+          description: "CPU usage < 20% for 5m"

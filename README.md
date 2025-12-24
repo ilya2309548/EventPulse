@@ -189,3 +189,61 @@ flowchart LR
 - Outbox: у производителей событий (Ingest, Rules, Action) для гарантии доставки.
 - Анти-флаппинг: `for:` в алертах и `cooldown` в Rule Engine.
 - Балансировка: Traefik автоматически видит новые реплики по Docker-лейблам.
+
+## Инфраструктура окружения (готово сейчас)
+
+В этом коммите добавлены:
+- Go-проект с заготовками сервисов EventPulse (`cmd/ingest`, `cmd/rule-engine`, `cmd/action-runner`, `cmd/incident-api`). Они пока не реализованы — просто стартуют и ждут (TBD).
+- Внешний стек для демонстрации алертов и вебхуков:
+  - Traefik (Docker provider) — роут `GET /work` на сервис `app`.
+  - `app` — простой Go-сервис, создающий CPU-нагрузку 50–100мс на запрос (`/work`) и `GET /healthz`.
+  - cAdvisor — метрики контейнеров.
+  - Prometheus — скрейпит cAdvisor, содержит правила HighCPU/LowCPU.
+  - Alertmanager — шлёт вебхук на `webhook-debug` при срабатывании/резолве.
+  - `webhook-debug` — Go-сервис, принимающий вебхук и логирующий payload.
+  - Load Generator — Vegeta, генерирует запросы к Traefik (`/work`).
+
+Структура файлов:
+- `docker-compose.yml` — оркестрация всего стека.
+- `cmd/app` — исходники CPU-приложения + Dockerfile.
+- `cmd/webhook-debug` — исходники вебхука + Dockerfile.
+- `monitoring/prometheus/{prometheus.yml,rules/cpu.yml}` — конфиг и правила алертов.
+- `monitoring/alertmanager/alertmanager.yml` — маршрутизация алертов в вебхук.
+- `traefik/` — (не требуется статический конфиг; Traefik настраивается через Docker-лейблы).
+
+## Быстрый запуск
+
+Требования: Docker Desktop (macOS), порты 80, 8081, 8080, 8082, 9090, 9093 свободны.
+
+1) Собрать и поднять стек:
+```
+docker compose up --build -d
+```
+
+2) Проверка доступности:
+- Traefik dashboard: http://localhost:8081
+- App через Traefik: http://localhost/work, health: http://localhost/healthz
+- cAdvisor: http://localhost:8082
+- Prometheus: http://localhost:9090
+- Alertmanager: http://localhost:9093
+- Webhook-debug: http://localhost:8080
+
+3) Нагрузка:
+- В составе `docker-compose.yml` запустится Vegeta, который будет слать запросы на `/work`.
+- При стабильной нагрузке правило HighCPU (>50% за 2m) сработает — смотрите Alerts в Prometheus/Alertmanager.
+- Alertmanager будет отправлять вебхук на `webhook-debug` — payload отобразится в логах контейнера `webhook-debug`.
+
+Останов:
+```
+docker compose down
+```
+
+## Замечания по метрикам CPU
+
+Правила используют метрику `container_cpu_usage_seconds_total` от cAdvisor и фильтруют по Docker-лейблу `service=app`. Для корректной работы лейбл проставлен на контейнере приложения через `docker-compose.yml`.
+
+## Дальнейшие шаги (EventPulse)
+- Реализация Telemetry Ingest: прием вебхука Alertmanager, нормализация, запись в БД, публикация `alert.raised`.
+- Реализация Rule Engine: потребление `alert.raised`, принятие решений, публикация `incident.opened` и `action.requested`.
+- Реализация Action Runner: исполнение `scale_docker`, публикация `action.completed`/`action.failed`.
+- Реализация Incident Store API: потребление I1/AC/AF, обновление состояния.
