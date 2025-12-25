@@ -6,5 +6,5 @@ route:
 receivers:
   - name: webhook
     webhook_configs:
-      - url: http://webhook-debug:8080/alertmanager
+      - url: http://ingest:8080/alertmanager
         send_resolved: true

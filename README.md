@@ -226,12 +226,13 @@ docker compose up --build -d
 - cAdvisor: http://localhost:8082
 - Prometheus: http://localhost:9090
 - Alertmanager: http://localhost:9093
-- Webhook-debug: http://localhost:8080
+- Webhook-debug (опционально): http://localhost:8080
 
-3) Нагрузка:
-- В составе `docker-compose.yml` запустится Vegeta, который будет слать запросы на `/work`.
-- При стабильной нагрузке правило HighCPU (>50% за 2m) сработает — смотрите Alerts в Prometheus/Alertmanager.
-- Alertmanager будет отправлять вебхук на `webhook-debug` — payload отобразится в логах контейнера `webhook-debug`.
+3) Нагрузка и поток алертов:
+- Генератор нагрузок (`loadgen`) шлёт запросы на `/work`.
+- При стабильной нагрузке правило HighCPU (>50% за 30s) сработает — смотрите Alerts в Prometheus/Alertmanager.
+- Alertmanager отправляет вебхук на Ingest (`http://ingest:8080/alertmanager`).
+- Ingest сохраняет состояние алертов в Postgres (контейнер `ingest-db`) и пишет событие `alert.raised` в `outbox_events` (минимальный outbox).
 
 ### Управление нагрузкой
 - Теперь используется локальный Go-генератор (`loadgen`).
@@ -269,6 +270,15 @@ sum by (container_label_service) (
 
 ## Дальнейшие шаги (EventPulse)
 - Реализация Telemetry Ingest: прием вебхука Alertmanager, нормализация, запись в БД, публикация `alert.raised`.
+  - Базовая версия реализована: `/alertmanager` → `alerts` + `outbox_events` в Postgres.
+
+### Базы данных для компонентов
+- Для каждого компонента свой контейнер Postgres:
+  - `ingest-db` (БД: ingest, пользователь: ingest)
+  - `rules-db` (БД: rules, пользователь: rules)
+  - `action-db` (БД: action, пользователь: action)
+  - `incident-db` (БД: incident, пользователь: incident)
+- Ingest подключается по DSN: `postgres://ingest:ingest@ingest-db:5432/ingest?sslmode=disable` (по умолчанию, задаётся в `docker-compose.yml`).
 - Реализация Rule Engine: потребление `alert.raised`, принятие решений, публикация `incident.opened` и `action.requested`.
 - Реализация Action Runner: исполнение `scale_docker`, публикация `action.completed`/`action.failed`.
 - Реализация Incident Store API: потребление I1/AC/AF, обновление состояния.
