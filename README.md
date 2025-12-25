@@ -233,6 +233,19 @@ docker compose up --build -d
 - При стабильной нагрузке правило HighCPU (>50% за 2m) сработает — смотрите Alerts в Prometheus/Alertmanager.
 - Alertmanager будет отправлять вебхук на `webhook-debug` — payload отобразится в логах контейнера `webhook-debug`.
 
+### Управление нагрузкой
+- Теперь используется локальный Go-генератор (`loadgen`) вместо Vegeta — это избавляет от проблемы несовпадения платформ (amd64 vs arm64) на Apple Silicon.
+- Параметры нагрузки задаются через переменные окружения сервиса `loadgen` в `docker-compose.yml`:
+  - `TARGET_URL` — целевой URL (например, `http://traefik/work?ms=300&workers=2`).
+  - `RATE` — запросов в секунду.
+  - `CONCURRENCY` — максимальная параллельность запросов.
+- Сам эндпойнт `/work` поддерживает параметры:
+  - `ms` — длительность CPU-нагрузки на воркер (мс), по умолчанию ~100–300мс с вариацией.
+  - `workers` — число параллельных горутин, имитирующих работу (по умолчанию 1).
+- Можно управлять количеством используемых CPU в контейнере приложения через:
+  - Переменную окружения `APP_GOMAXPROCS` (например, `2`).
+  - Ограничение `cpus: "0.5"` в `docker-compose.yml` для контейнера `app` — помогает быстрее достигать высокую загрузку (в локальном Compose).
+
 Останов:
 ```
 docker compose down
@@ -241,6 +254,25 @@ docker compose down
 ## Замечания по метрикам CPU
 
 Правила используют метрику `container_cpu_usage_seconds_total` от cAdvisor и фильтруют по Docker-лейблу `service=app`. Для корректной работы лейбл проставлен на контейнере приложения через `docker-compose.yml`.
+
+Для визуализации процента загрузки используйте в Prometheus:
+
+```
+sum by (container_label_service) (
+  rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[2m])
+)
+```
+
+Значение `1.0` соответствует полной загрузке одного CPU (ядра). Порог `0.5` — примерно 50% одного CPU.
+
+## Apple Silicon (ARM64) и несовпадение платформ
+
+Если видите предупреждение вида:
+"The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8)"
+
+- Предпочтительный путь: собирать свои образы локально (как сделано для `app`, `webhook-debug`, `loadgen`) — Docker соберёт их под ARM64.
+- Альтернатива: указать `platform: linux/arm64` для сервисов в Compose (если образ поддерживает мультиарх).
+- Или включить эмуляцию (Rosetta/QEMU), но это медленнее и не рекомендуется для нагрузки.
 
 ## Дальнейшие шаги (EventPulse)
 - Реализация Telemetry Ingest: прием вебхука Alertmanager, нормализация, запись в БД, публикация `alert.raised`.

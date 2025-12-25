@@ -4,9 +4,9 @@ groups:
       - alert: HighCPUApp
         expr: |
           sum by (container_label_service) (
-            rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[2m])
+            rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[30s])
           ) > 0.5
-        for: 2m
+        for: 30s
         labels:
           severity: warning
         annotations:
@@ -16,9 +16,9 @@ groups:
       - alert: LowCPUApp
         expr: |
           sum by (container_label_service) (
-            rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[5m])
+            rate(container_cpu_usage_seconds_total{container_label_service="app", image!=""}[1m])
           ) < 0.2
-        for: 5m
+        for: 1m
         labels:
           severity: info
         annotations:

@@ -7,6 +7,9 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/ilya2309548/EventPulse/internal/common"
@@ -25,10 +28,34 @@ func cpuBurn(d time.Duration) {
 }
 
 func workHandler(w http.ResponseWriter, r *http.Request) {
-	// Burn ~50–100ms CPU per request
-	d := 50 + rand.Intn(50)
-	cpuBurn(time.Duration(d) * time.Millisecond)
-	fmt.Fprintf(w, "ok %dms\n", d)
+	// Tunable CPU burn via query params: ms (duration) and workers (parallel goroutines)
+	// Defaults: 100ms, 1 worker
+	ms := 100
+	workers := 1
+	if v := r.URL.Query().Get("ms"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ms = n
+		}
+	} else {
+		// If not provided, randomize lightly to create variance
+		ms = 100 + rand.Intn(200) // 100–300ms
+	}
+	if v := r.URL.Query().Get("workers"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workers = n
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			cpuBurn(time.Duration(ms) * time.Millisecond)
+		}()
+	}
+	wg.Wait()
+	fmt.Fprintf(w, "ok %dms workers=%d\n", ms, workers)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +71,14 @@ func main() {
 	common.Init("app-service")
 	// Seed randomness
 	rand.Seed(time.Now().UnixNano())
+
+	// Optionally set GOMAXPROCS via env APP_GOMAXPROCS to burn multiple cores inside container
+	if v := os.Getenv("APP_GOMAXPROCS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			runtime.GOMAXPROCS(n)
+			log.Printf("GOMAXPROCS set to %d", n)
+		}
+	}
 
 	http.HandleFunc("/work", workHandler)
 	http.HandleFunc("/healthz", healthHandler)

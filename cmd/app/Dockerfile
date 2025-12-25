@@ -1,7 +1,6 @@
 # Build stage
 FROM golang:1.22-alpine AS build
 WORKDIR /src
-RUN apk add --no-cache build-base
 COPY go.mod ./
 COPY internal ./internal
 COPY cmd/app ./cmd/app
