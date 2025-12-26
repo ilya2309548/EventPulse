@@ -121,6 +121,8 @@ services:
       - POSTGRES_PASSWORD=rules
     volumes:
       - rules-db-data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rules"]
       interval: 10s
@@ -151,6 +153,27 @@ services:
       - incident-db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U incident"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  rule-engine:
+    build:
+      context: .
+      dockerfile: cmd/rule-engine/Dockerfile
+    environment:
+      - RULES_DB_DSN=postgres://rules:rules@rules-db:5432/rules?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_ALERT_RAISED=alert.raised
+      - KAFKA_TOPIC_INCIDENT_OPENED=incident.opened
+      - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
+    depends_on:
+      rules-db:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
       interval: 10s
       timeout: 3s
       retries: 5
