@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -89,12 +90,15 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// Write outbox event alert.raised
+		// Deduplication key: fingerprint + event_type + status
+		dedupKey := fmt.Sprintf("%s:%s:%s", a.Fingerprint, "alert.raised", a.Status)
 		payload := map[string]any{
 			"type":        "alert.raised",
 			"fingerprint": a.Fingerprint,
 			"status":      a.Status,
 			"labels":      a.Labels,
 			"annotations": a.Annotations,
+			"dedup_key":   dedupKey,
 		}
 		pjson, _ := json.Marshal(payload)
 		_, err = tx.Exec(`INSERT INTO outbox_events (type, payload, created_at) VALUES ($1,$2,$3)`, "alert.raised", string(pjson), now)

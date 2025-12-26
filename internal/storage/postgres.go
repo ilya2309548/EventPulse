@@ -45,6 +45,11 @@ func Migrate(db *sql.DB) error {
 			payload TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS inbox (
+			id SERIAL PRIMARY KEY,
+			dedup_key TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {

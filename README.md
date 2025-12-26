@@ -283,6 +283,31 @@ sum by (container_label_service) (
 - Реализация Action Runner: исполнение `scale_docker`, публикация `action.completed`/`action.failed`.
 - Реализация Incident Store API: потребление I1/AC/AF, обновление состояния.
 
+### Дедупликация событий (ключи и inbox)
+
+Чтобы исключать повторную обработку одинаковых событий (например, при ретраях доставки или ребалансах консьюмеров), используется устойчивый ключ дедупликации и паттерн Inbox:
+
+- Формула ключа (для алертов):
+  - `dedup_key = fingerprint + ':' + event_type + ':' + status`
+  - Для события `alert.raised`: `fingerprint:alert.raised:status`.
+- Производитель (Ingest) добавляет `dedup_key` в payload события, которое пишет в `outbox_events`.
+- Потребитель (Rule Engine / Action Runner / Incident Store) перед обработкой пытается вставить запись в таблицу `inbox`:
+  - `INSERT INTO inbox (dedup_key, created_at) VALUES ($1, now)`
+  - На `inbox(dedup_key)` есть уникальный индекс.
+  - Если вставка успешна — событие обрабатывается; если нарушение уникальности — событие повторное, его пропускаем.
+
+Схема `inbox` создаётся миграциями Ingest (для демонстрации):
+
+```
+CREATE TABLE IF NOT EXISTS inbox (
+  id SERIAL PRIMARY KEY,
+  dedup_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+```
+
+Так достигается идемпотентность: «обработал — зафиксировал ключ». У каждого сервиса своя БД и свой `inbox`, но принцип одинаковый.
+
 ## Самовосстановление только на уровне Action Runner
 
 В этой версии самовосстановление реализуем только у Action Runner; остальные сервисы (Ingest, Rule Engine, Incident Store) общаются по событиям без дополнительных усложнений.
