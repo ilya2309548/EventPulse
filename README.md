@@ -308,6 +308,68 @@ CREATE TABLE IF NOT EXISTS inbox (
 
 Так достигается идемпотентность: «обработал — зафиксировал ключ». У каждого сервиса своя БД и свой `inbox`, но принцип одинаковый.
 
+### Kafka (Redpanda) и топики
+
+Для обмена событиями используется совместимый с Kafka брокер Redpanda:
+
+- Брокер: сервис `redpanda` (порт 9092 для Kafka API, 9644 — админ HTTP)
+- Консоль: `redpanda-console` (UI на http://localhost:8086)
+- Инициализация топиков: `kafka-init` создаёт топики при старте
+
+Топики (минимальный набор):
+- `alert.raised`
+- `incident.opened`
+- `action.requested`
+- `action.completed`
+- `action.failed`
+
+Запуск (локально):
+
+```
+docker compose up -d redpanda redpanda-console kafka-init
+```
+
+Проверка:
+- Откройте Redpanda Console: http://localhost:8086 → Topics → убедитесь, что топики созданы.
+- Быстрая публикация/чтение через `rpk`:
+
+```
+# Продюсинг тестового события
+docker run --rm --network eventpulse_default redpandadata/redpanda:latest \
+  rpk topic produce alert.raised -X brokers=redpanda:9092 <<<'{"type":"alert.raised","fingerprint":"demo","status":"firing"}'
+
+# Консюминг (просмотр последних сообщений)
+docker run --rm --network eventpulse_default redpandadata/redpanda:latest \
+  rpk topic consume alert.raised -X brokers=redpanda:9092 -n 5
+```
+
+Дальше сервисы Rule Engine / Action Runner / Incident API будут подписываться/публиковать в эти топики согласно хореографии.
+
+### Дедупликация событий (ключи и inbox)
+
+Чтобы исключать повторную обработку одинаковых событий (например, при ретраях доставки или ребалансах консьюмеров), используется устойчивый ключ дедупликации и паттерн Inbox:
+
+- Формула ключа (для алертов):
+  - `dedup_key = fingerprint + ':' + event_type + ':' + status`
+  - Для события `alert.raised`: `fingerprint:alert.raised:status`.
+- Производитель (Ingest) добавляет `dedup_key` в payload события, которое пишет в `outbox_events`.
+- Потребитель (Rule Engine / Action Runner / Incident Store) перед обработкой пытается вставить запись в таблицу `inbox`:
+  - `INSERT INTO inbox (dedup_key, created_at) VALUES ($1, now)`
+  - На `inbox(dedup_key)` есть уникальный индекс.
+  - Если вставка успешна — событие обрабатывается; если нарушение уникальности — событие повторное, его пропускаем.
+
+Схема `inbox` создаётся миграциями Ingest (для демонстрации):
+
+```
+CREATE TABLE IF NOT EXISTS inbox (
+  id SERIAL PRIMARY KEY,
+  dedup_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+```
+
+Так достигается идемпотентность: «обработал — зафиксировал ключ». У каждого сервиса своя БД и свой `inbox`, но принцип одинаковый.
+
 ## Самовосстановление только на уровне Action Runner
 
 В этой версии самовосстановление реализуем только у Action Runner; остальные сервисы (Ingest, Rule Engine, Incident Store) общаются по событиям без дополнительных усложнений.

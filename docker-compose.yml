@@ -72,6 +72,8 @@ services:
       dockerfile: cmd/ingest/Dockerfile
     environment:
       - INGEST_DB_DSN=postgres://ingest:ingest@ingest-db:5432/ingest?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_ALERT_RAISED=alert.raised
     ports:
       - "8085:8080"
     depends_on:
@@ -152,6 +154,47 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr 0.0.0.0:9092
+      - --advertise-kafka-addr redpanda:9092
+    ports:
+      - "9092:9092"   # Kafka API
+      - "9644:9644"   # Admin HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info -X brokers=redpanda:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8086:8080"   # Console UI
+
+  kafka-init:
+    image: redpandadata/redpanda:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh","-c"]
+    command: >-
+      "rpk topic create alert.raised incident.opened action.requested action.completed action.failed \
+      -X brokers=redpanda:9092 || true"
 
 volumes:
   ingest-db-data:

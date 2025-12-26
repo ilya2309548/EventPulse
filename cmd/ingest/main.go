@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
+
+	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/ilya2309548/EventPulse/internal/common"
 	"github.com/ilya2309548/EventPulse/internal/storage"
@@ -29,8 +33,9 @@ type Webhook struct {
 }
 
 type Server struct {
-	db    *sql.DB
-	ready bool
+	db          *sql.DB
+	ready       bool
+	alertWriter *kafka.Writer
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +72,8 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	// Collect messages to publish after DB commit
+	var msgs []kafka.Message
 	// Process each alert; upsert-like: increment occurrences by fingerprint
 	for _, a := range wh.Alerts {
 		labelsJSON, _ := json.Marshal(a.Labels)
@@ -99,6 +106,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			"labels":      a.Labels,
 			"annotations": a.Annotations,
 			"dedup_key":   dedupKey,
+			"created_at":  now,
 		}
 		pjson, _ := json.Marshal(payload)
 		_, err = tx.Exec(`INSERT INTO outbox_events (type, payload, created_at) VALUES ($1,$2,$3)`, "alert.raised", string(pjson), now)
@@ -107,10 +115,20 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		// Prepare Kafka message (best-effort after commit)
+		msgs = append(msgs, kafka.Message{Value: pjson})
 	}
 	if err := tx.Commit(); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
+	}
+	// Publish to Kafka (best-effort)
+	if s.alertWriter != nil && len(msgs) > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.alertWriter.WriteMessages(ctx, msgs...); err != nil {
+			log.Printf("kafka publish alert.raised failed: %v", err)
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
@@ -129,7 +147,26 @@ func main() {
 	if err := storage.Migrate(db); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
-	srv := &Server{db: db, ready: true}
+	// Kafka writer setup
+	var writer *kafka.Writer
+	brokersEnv := strings.TrimSpace(os.Getenv("KAFKA_BROKERS"))
+	topicAlert := strings.TrimSpace(os.Getenv("KAFKA_TOPIC_ALERT_RAISED"))
+	if topicAlert == "" {
+		topicAlert = "alert.raised"
+	}
+	if brokersEnv != "" {
+		brokers := strings.Split(brokersEnv, ",")
+		writer = &kafka.Writer{
+			Addr:     kafka.TCP(brokers...),
+			Topic:    topicAlert,
+			Balancer: &kafka.LeastBytes{},
+		}
+		log.Printf("kafka writer configured: brokers=%v topic=%s", brokers, topicAlert)
+	} else {
+		log.Printf("kafka writer disabled: KAFKA_BROKERS not set")
+	}
+
+	srv := &Server{db: db, ready: true, alertWriter: writer}
 
 	http.HandleFunc("/health", srv.handleHealth)
 	http.HandleFunc("/ready", srv.handleReady)
