@@ -134,6 +134,7 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 				typ:   "action.requested",
 				body: map[string]any{
 					"type":             "action.requested",
+					"alert_fp":         fingerprint,
 					"kind":             "scale_docker",
 					"desired_replicas": 2,
 					"created_at":       now,
@@ -151,6 +152,7 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 				typ:   "action.requested",
 				body: map[string]any{
 					"type":             "action.requested",
+					"alert_fp":         fingerprint,
 					"kind":             "scale_docker",
 					"desired_replicas": 1,
 					"created_at":       now,
