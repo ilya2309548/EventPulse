@@ -94,15 +94,7 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 	status, _ := payload["status"].(string)
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	// Inbox dedup: fingerprint + event_type + status at Rule Engine scope
-	dedup := fmt.Sprintf("%s:%s:%s", fingerprint, "alert.raised", status)
-	if err := insertInbox(re.db, dedup, now); err != nil {
-		// unique violation -> skip
-		if strings.Contains(err.Error(), "unique") || strings.Contains(strings.ToLower(err.Error()), "duplicate") {
-			return nil
-		}
-		return err
-	}
+	// Always process alert.raised events; downstream consumers enforce idempotency.
 
 	// Decision: for firing -> open incident + request scale to 2; for resolved -> request scale to 1
 	var outMsgs []struct {

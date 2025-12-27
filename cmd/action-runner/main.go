@@ -262,6 +262,7 @@ func (r *Runner) executeScale(kind string, desired int) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("scale_docker: current=%d desired=%d", len(cur), desired)
 	if len(cur) < desired {
 		missing := desired - len(cur)
 		for i := 0; i < missing; i++ {
@@ -279,6 +280,7 @@ func (r *Runner) executeScale(kind string, desired int) error {
 				break
 			}
 			if c.ManagedBy == "action-runner" {
+				log.Printf("removing managed container id=%s", c.ID)
 				if err := r.removeContainer(ctx, c.ID); err != nil {
 					log.Printf("remove container %s failed: %v", c.ID, err)
 					continue
@@ -292,6 +294,7 @@ func (r *Runner) executeScale(kind string, desired int) error {
 				if removed >= toRemove {
 					break
 				}
+				log.Printf("force removing container id=%s managed-by=%s", c.ID, c.ManagedBy)
 				if err := r.removeContainer(ctx, c.ID); err != nil {
 					log.Printf("force remove container %s failed: %v", c.ID, err)
 					continue
@@ -304,6 +307,7 @@ func (r *Runner) executeScale(kind string, desired int) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("scale_docker: final=%d desired=%d", len(final), desired)
 	if len(final) != desired {
 		return fmt.Errorf("replica convergence failed: have=%d desired=%d", len(final), desired)
 	}
