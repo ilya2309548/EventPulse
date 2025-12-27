@@ -113,6 +113,8 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 
 	switch status {
 	case "firing":
+		actID := fmt.Sprintf("act-%d", time.Now().UnixNano())
+		incID := fmt.Sprintf("inc-%d", time.Now().UnixNano())
 		outMsgs = append(outMsgs,
 			struct {
 				topic, typ string
@@ -121,10 +123,11 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 				topic: re.incidentWriter.Topic,
 				typ:   "incident.opened",
 				body: map[string]any{
-					"type":       "incident.opened",
-					"alert_fp":   fingerprint,
-					"created_at": now,
-					"dedup_key":  fmt.Sprintf("%s:%s", fingerprint, "incident.opened"),
+					"type":        "incident.opened",
+					"alert_fp":    fingerprint,
+					"incident_id": incID,
+					"created_at":  now,
+					"dedup_key":   incID,
 				},
 			},
 			struct {
@@ -138,12 +141,14 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 					"alert_fp":         fingerprint,
 					"kind":             "scale_docker",
 					"desired_replicas": 2,
+					"action_id":        actID,
 					"created_at":       now,
-					"dedup_key":        fmt.Sprintf("%s:%s:%d", fingerprint, "action.requested", 2),
+					"dedup_key":        actID,
 				},
 			},
 		)
 	case "resolved":
+		actID := fmt.Sprintf("act-%d", time.Now().UnixNano())
 		outMsgs = append(outMsgs,
 			struct {
 				topic, typ string
@@ -156,8 +161,9 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 					"alert_fp":         fingerprint,
 					"kind":             "scale_docker",
 					"desired_replicas": 1,
+					"action_id":        actID,
 					"created_at":       now,
-					"dedup_key":        fmt.Sprintf("%s:%s:%d", fingerprint, "action.requested", 1),
+					"dedup_key":        actID,
 				},
 			},
 		)
@@ -222,12 +228,15 @@ func (re *RuleEngine) monitorRunners(services []string, interval time.Duration, 
 					continue
 				}
 				now := time.Now().UTC().Format(time.RFC3339)
+				incID := fmt.Sprintf("inc-%d", time.Now().UnixNano())
+				actID := fmt.Sprintf("act-%d", time.Now().UnixNano())
 				// incident.opened
 				inc := map[string]any{
-					"type":       "incident.opened",
-					"alert_fp":   fmt.Sprintf("outage(%s)", svc),
-					"created_at": now,
-					"dedup_key":  fmt.Sprintf("%s:%s", svc, "incident.opened"),
+					"type":        "incident.opened",
+					"alert_fp":    fmt.Sprintf("outage(%s)", svc),
+					"incident_id": incID,
+					"created_at":  now,
+					"dedup_key":   incID,
 				}
 				// action.requested restart_runner
 				act := map[string]any{
@@ -235,8 +244,9 @@ func (re *RuleEngine) monitorRunners(services []string, interval time.Duration, 
 					"kind":          "restart_runner",
 					"alert_fp":      fmt.Sprintf("outage(%s)", svc),
 					"target_runner": svc,
+					"action_id":     actID,
 					"created_at":    now,
-					"dedup_key":     fmt.Sprintf("%s:%s", svc, "restart_runner"),
+					"dedup_key":     actID,
 				}
 				// outbox
 				p1, _ := json.Marshal(inc)

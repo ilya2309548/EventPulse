@@ -319,10 +319,17 @@ func (r *Runner) processAction(msg kafka.Message) error {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Prefer explicit action_id for idempotency; fall back to dedup_key
+	actionID, _ := m["action_id"].(string)
 	dedup, _ := m["dedup_key"].(string)
+	if actionID == "" {
+		actionID = dedup
+	}
+	if actionID == "" {
+		actionID = fmt.Sprintf("act-%d", time.Now().UnixNano())
+	}
 	if dedup == "" {
-		// Fallback action id
-		dedup = fmt.Sprintf("%d", time.Now().UnixNano())
+		dedup = actionID
 	}
 	// Inbox dedup
 	if err := insertInbox(r.db, dedup, now); err != nil {
@@ -340,7 +347,7 @@ func (r *Runner) processAction(msg kafka.Message) error {
 	targetRunner, _ := m["target_runner"].(string)
 
 	// Record start
-	if err := r.recordAction(dedup, kind, desired, alertFP, "running", "", now); err != nil {
+	if err := r.recordAction(actionID, kind, desired, alertFP, "running", "", now); err != nil {
 		log.Printf("record action start failed: %v", err)
 	}
 
@@ -358,17 +365,17 @@ func (r *Runner) processAction(msg kafka.Message) error {
 	}
 	if execErr != nil {
 		// Failure path
-		_ = r.recordAction(dedup, kind, desired, alertFP, "failed", execErr.Error(), now)
+		_ = r.recordAction(actionID, kind, desired, alertFP, "failed", execErr.Error(), now)
 		payload := map[string]any{
 			"type":             "action.failed",
-			"action_id":        dedup,
+			"action_id":        actionID,
 			"kind":             kind,
 			"desired_replicas": desired,
 			"alert_fp":         alertFP,
 			"error":            execErr.Error(),
 			"target_runner":    targetRunner,
 			"created_at":       now,
-			"dedup_key":        dedup + ":failed",
+			"dedup_key":        actionID + ":failed",
 		}
 		if perr := r.publishResult(ctx, r.failedSink.Topic, payload); perr != nil {
 			log.Printf("publish action.failed error: %v", perr)
@@ -377,16 +384,16 @@ func (r *Runner) processAction(msg kafka.Message) error {
 	}
 
 	// Success path
-	_ = r.recordAction(dedup, kind, desired, alertFP, "completed", "", now)
+	_ = r.recordAction(actionID, kind, desired, alertFP, "completed", "", now)
 	payload := map[string]any{
 		"type":             "action.completed",
-		"action_id":        dedup,
+		"action_id":        actionID,
 		"kind":             kind,
 		"desired_replicas": desired,
 		"alert_fp":         alertFP,
 		"target_runner":    targetRunner,
 		"created_at":       now,
-		"dedup_key":        dedup + ":completed",
+		"dedup_key":        actionID + ":completed",
 	}
 	if perr := r.publishResult(ctx, r.completedSink.Topic, payload); perr != nil {
 		log.Printf("publish action.completed error: %v", perr)
