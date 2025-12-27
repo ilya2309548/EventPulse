@@ -250,6 +250,137 @@ docker compose up --build -d
 docker compose down
 ```
 
+## Руководство по пользованию и проверке (локально)
+
+Ниже — краткие шаги для проверки реализованных сервисов Action Runner и Incident Store API, а также сценариев автоскейлинга и восстановления.
+
+### 1) Запуск стека
+
+```bash
+docker compose up --build -d
+```
+
+Проверки доступности:
+- Traefik dashboard: http://localhost:8081
+- Приложение через Traefik: http://localhost/work, здоровье: http://localhost/healthz
+- Redpanda Console (Kafka UI): http://localhost:8086
+- Incident API: http://localhost:8091/incidents
+
+Базы данных доступны на localhost:
+- ingest-db: localhost:5434
+- rules-db: localhost:5435
+- action-db: localhost:5436
+- incident-db: localhost:5437
+
+### 2) Сгенерировать «firing» алерт (HighCPU)
+
+Отправьте webhook в Ingest (это имитирует срабатывание Alertmanager):
+
+```bash
+curl -s -X POST http://localhost:8085/alertmanager \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "status":"firing",
+    "alerts":[{
+      "status":"firing",
+      "labels":{"alertname":"HighCPU"},
+      "annotations":{"summary":"CPU high"},
+      "startsAt":"2025-01-01T00:00:00Z",
+      "endsAt":"",
+      "fingerprint":"fp-demo-123"
+    }]
+  }'
+```
+
+Ожидаемая реакция:
+- Ingest публикует `alert.raised`.
+- Rule Engine эмитит `incident.opened` и `action.requested` с `desired_replicas=2`.
+- Action Runner масштабирует сервис `app` до 2 реплик, публикует `action.completed`.
+- Incident API фиксирует инцидент и переводит его в `resolved`.
+
+Проверки:
+- Реплики приложения:
+  ```bash
+  docker ps --filter label=service=app --format '{{.ID}} {{.Image}} {{.Names}}'
+  ```
+  Должны быть baseline `eventpulse-app-1` и дополнительная реплика `app-replica-...`.
+- Инциденты:
+  ```bash
+  curl -s http://localhost:8091/incidents | jq
+  ```
+  Запись со статусом `resolved` для `alert_fp="fp-demo-123"`.
+
+### 3) Сгенерировать «resolved» алерт (LowCPU/компенсация)
+
+```bash
+curl -s -X POST http://localhost:8085/alertmanager \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "status":"resolved",
+    "alerts":[{
+      "status":"resolved",
+      "labels":{"alertname":"HighCPU"},
+      "annotations":{"summary":"CPU high"},
+      "startsAt":"2025-01-01T00:00:00Z",
+      "endsAt":"2025-01-01T02:00:00Z",
+      "fingerprint":"fp-demo-123"
+    }]
+  }'
+```
+
+Ожидаемая реакция:
+- Rule Engine публикует `action.requested` с `desired_replicas=1`.
+- Action Runner уменьшает число реплик до 1, публикует `action.completed`.
+- `docker ps --filter label=service=app` показывает только `eventpulse-app-1`.
+
+### 4) Демонстрация восстановления (2 раннера)
+
+Остановите один раннер:
+
+```bash
+docker compose stop action-runner-a
+```
+
+Сгенерируйте новый firing-алерт (другой fingerprint):
+
+```bash
+curl -s -X POST http://localhost:8085/alertmanager \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "status":"firing",
+    "alerts":[{
+      "status":"firing",
+      "labels":{"alertname":"HighCPU"},
+      "annotations":{"summary":"CPU high"},
+      "startsAt":"2025-01-01T00:00:00Z",
+      "endsAt":"",
+      "fingerprint":"fp-demo-456"
+    }]
+  }'
+```
+
+Ожидаемая реакция:
+- Второй раннер (оставшийся в consumer group) обработает `action.requested` и выполнит масштабирование.
+- В `docker ps --filter label=service=app` появится дополнительная реплика.
+
+Верните раннер назад:
+
+```bash
+docker compose start action-runner-a
+```
+
+### 5) Остановка всего стека
+
+```bash
+docker compose down
+```
+
+### Примечания
+
+- Action Runner управляет контейнерами через Docker CLI (в образе установлен `docker-cli` и примонтирован `/var/run/docker.sock`).
+- Реплики помечаются лейблами `service=app` и `managed-by=action-runner` для корректного обнаружения и приоритета удаления.
+- Traefik автоматически видит новые реплики по лейблам и балансирует `/work`.
+
 ## Замечания по метрикам CPU
 
 Правила используют метрику `container_cpu_usage_seconds_total` от cAdvisor и фильтруют по Docker-лейблу `service=app`. Для корректной работы лейбл проставлен на контейнере приложения через `docker-compose.yml`.

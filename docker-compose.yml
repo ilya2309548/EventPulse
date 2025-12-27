@@ -258,6 +258,9 @@ services:
       - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
       - KAFKA_TOPIC_ACTION_COMPLETED=action.completed
       - KAFKA_TOPIC_ACTION_FAILED=action.failed
+      - HEALTH_URL=http://app:8080/healthz
+      - DOCKER_IMAGE=eventpulse-app:latest
+      - DOCKER_NETWORK=eventpulse_default
     depends_on:
       action-db:
         condition: service_healthy
@@ -282,6 +285,9 @@ services:
       - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
       - KAFKA_TOPIC_ACTION_COMPLETED=action.completed
       - KAFKA_TOPIC_ACTION_FAILED=action.failed
+      - HEALTH_URL=http://app:8080/healthz
+      - DOCKER_IMAGE=eventpulse-app:latest
+      - DOCKER_NETWORK=eventpulse_default
     depends_on:
       action-db:
         condition: service_healthy

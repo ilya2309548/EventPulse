@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -25,6 +27,8 @@ type Runner struct {
 	reader        *kafka.Reader
 	completedSink *kafka.Writer
 	failedSink    *kafka.Writer
+	dockerImage   string
+	dockerNetwork string
 }
 
 func migrate(db *sql.DB) error {
@@ -113,19 +117,141 @@ func (r *Runner) publishResult(ctx context.Context, topic string, payload map[st
 	return w.WriteMessages(ctx, kafka.Message{Value: pjson})
 }
 
-func (r *Runner) executeScale(kind string, desired int) error {
-	// Minimal stub: optionally probe health to simulate convergence
-	// In a fuller version, this would call Docker API to add/remove containers with label service=app
-	// Here we just wait a short time and check Traefik/app health endpoint.
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://traefik/healthz")
-		if err == nil && resp.StatusCode == 200 {
-			return nil
-		}
-		time.Sleep(1 * time.Second)
+func (r *Runner) listAppContainers(ctx context.Context) ([]struct {
+	ID        string
+	ManagedBy string
+}, error) {
+	// Use docker CLI to list containers by label service=app
+	cmd := exec.CommandContext(ctx, "docker", "ps", "-q", "--filter", "label=service=app")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
 	}
-	return fmt.Errorf("readiness not achieved for kind=%s desired=%d", kind, desired)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	var res []struct {
+		ID        string
+		ManagedBy string
+	}
+	for _, id := range lines {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		// Get managed-by label for preference on removals
+		lblCmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{ index .Config.Labels \"managed-by\" }}", id)
+		var lblOut bytes.Buffer
+		lblCmd.Stdout = &lblOut
+		_ = lblCmd.Run()
+		res = append(res, struct {
+			ID        string
+			ManagedBy string
+		}{ID: id, ManagedBy: strings.TrimSpace(lblOut.String())})
+	}
+	return res, nil
+}
+
+func (r *Runner) createAppReplica(ctx context.Context) (string, error) {
+	img := strings.TrimSpace(r.dockerImage)
+	if img == "" {
+		img = "eventpulse-app:latest"
+	}
+	name := fmt.Sprintf("app-replica-%d", time.Now().UnixNano())
+	args := []string{
+		"run", "-d",
+		"--label", "traefik.enable=true",
+		"--label", "traefik.http.routers.app.rule=Path(`/work`)",
+		"--label", "traefik.http.routers.app.entrypoints=web",
+		"--label", "traefik.http.services.app.loadbalancer.server.port=8080",
+		"--label", "service=app",
+		"--label", "managed-by=action-runner",
+		"--env", "SERVICE=app",
+		"--env", "APP_GOMAXPROCS=1",
+		"--restart", "always",
+	}
+	if r.dockerNetwork != "" {
+		args = append(args, "--network", r.dockerNetwork)
+	}
+	args = append(args, "--name", name, img)
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("docker run failed: %s", out.String())
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func (r *Runner) removeContainer(ctx context.Context, id string) error {
+	// Stop and remove force
+	stop := exec.CommandContext(ctx, "docker", "rm", "-f", id)
+	var out bytes.Buffer
+	stop.Stdout = &out
+	stop.Stderr = &out
+	if err := stop.Run(); err != nil {
+		return fmt.Errorf("docker rm failed: %s", out.String())
+	}
+	return nil
+}
+
+func (r *Runner) executeScale(kind string, desired int) error {
+	if strings.ToLower(kind) != "scale_docker" {
+		return fmt.Errorf("unsupported action kind: %s", kind)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cur, err := r.listAppContainers(ctx)
+	if err != nil {
+		return err
+	}
+	if len(cur) < desired {
+		missing := desired - len(cur)
+		for i := 0; i < missing; i++ {
+			if _, err := r.createAppReplica(ctx); err != nil {
+				return fmt.Errorf("create replica: %w", err)
+			}
+		}
+	} else if len(cur) > desired {
+		// Prefer removing managed-by=action-runner and the newest ones
+		// No created timestamp via CLI, rely on managed-by preference
+		toRemove := len(cur) - desired
+		removed := 0
+		for _, c := range cur {
+			if removed >= toRemove {
+				break
+			}
+			if c.ManagedBy == "action-runner" {
+				if err := r.removeContainer(ctx, c.ID); err != nil {
+					log.Printf("remove container %s failed: %v", c.ID, err)
+					continue
+				}
+				removed++
+			}
+		}
+		if removed < toRemove {
+			cur2, _ := r.listAppContainers(ctx)
+			for _, c := range cur2 {
+				if removed >= toRemove {
+					break
+				}
+				if err := r.removeContainer(ctx, c.ID); err != nil {
+					log.Printf("force remove container %s failed: %v", c.ID, err)
+					continue
+				}
+				removed++
+			}
+		}
+	}
+	final, err := r.listAppContainers(ctx)
+	if err != nil {
+		return err
+	}
+	if len(final) != desired {
+		return fmt.Errorf("replica convergence failed: have=%d desired=%d", len(final), desired)
+	}
+	return nil
 }
 
 func (r *Runner) processAction(msg kafka.Message) error {
@@ -243,7 +369,10 @@ func main() {
 	completedWriter := &kafka.Writer{Addr: kafka.TCP(brokers...), Topic: topicCompleted, Balancer: &kafka.LeastBytes{}}
 	failedWriter := &kafka.Writer{Addr: kafka.TCP(brokers...), Topic: topicFailed, Balancer: &kafka.LeastBytes{}}
 
-	r := &Runner{db: db, ready: true, reader: reader, completedSink: completedWriter, failedSink: failedWriter}
+	dockerImage := strings.TrimSpace(os.Getenv("DOCKER_IMAGE"))
+	dockerNetwork := strings.TrimSpace(os.Getenv("DOCKER_NETWORK"))
+
+	r := &Runner{db: db, ready: true, reader: reader, completedSink: completedWriter, failedSink: failedWriter, dockerImage: dockerImage, dockerNetwork: dockerNetwork}
 
 	http.HandleFunc("/health", r.handleHealth)
 	http.HandleFunc("/ready", r.handleReady)
