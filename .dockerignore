@@ -1,0 +1,6 @@
+**/bin
+**/obj
+**/vendor
+**/.git
+**/.github
+node_modules

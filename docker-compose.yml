@@ -1,0 +1,313 @@
+services:
+  traefik:
+    image: traefik:v2.11
+    command:
+      - --providers.docker=true
+      - --entrypoints.web.address=:80
+      - --api.insecure=true
+    ports:
+      - "80:80"
+      - "8081:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  app:
+    build:
+      context: .
+      dockerfile: cmd/app/Dockerfile
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=Path(`/work`)"
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.services.app.loadbalancer.server.port=8080"
+      - "service=app"
+    environment:
+      - SERVICE=app
+      - APP_GOMAXPROCS=1
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+    cpus: "1.0"
+  # Remove CPU cap to allow higher peaks; control load via /work?ms=...&workers=... and APP_GOMAXPROCS
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    ports:
+      - "8082:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+  webhook-debug:
+    build:
+      context: .
+      dockerfile: cmd/webhook-debug/Dockerfile
+    ports:
+      - "8080:8080"
+    # Keep for debugging; not used as receiver now
+  ingest:
+    build:
+      context: .
+      dockerfile: cmd/ingest/Dockerfile
+    environment:
+      - INGEST_DB_DSN=postgres://ingest:ingest@ingest-db:5432/ingest?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_ALERT_RAISED=alert.raised
+    ports:
+      - "8085:8080"
+    depends_on:
+      ingest-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+
+  loadgen:
+    build:
+      context: .
+      dockerfile: cmd/loadgen/Dockerfile
+    depends_on:
+      - traefik
+      - app
+    environment:
+      - TARGET_URL=http://traefik/work?ms=800&workers=4
+      - RATE=300
+      - CONCURRENCY=100
+
+  ingest-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=ingest
+      - POSTGRES_USER=ingest
+      - POSTGRES_PASSWORD=ingest
+    volumes:
+      - ingest-db-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingest"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  rules-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=rules
+      - POSTGRES_USER=rules
+      - POSTGRES_PASSWORD=rules
+    volumes:
+      - rules-db-data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rules"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  action-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=action
+      - POSTGRES_USER=action
+      - POSTGRES_PASSWORD=action
+    volumes:
+      - action-db-data:/var/lib/postgresql/data
+    ports:
+      - "5436:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U action"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  incident-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=incident
+      - POSTGRES_USER=incident
+      - POSTGRES_PASSWORD=incident
+    volumes:
+      - incident-db-data:/var/lib/postgresql/data
+    ports:
+      - "5437:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U incident"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  rule-engine:
+    build:
+      context: .
+      dockerfile: cmd/rule-engine/Dockerfile
+    environment:
+      - RULES_DB_DSN=postgres://rules:rules@rules-db:5432/rules?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_ALERT_RAISED=alert.raised
+      - KAFKA_TOPIC_INCIDENT_OPENED=incident.opened
+      - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
+      - RUNNER_SERVICES=action-runner-a,action-runner-b
+      - RUNNER_CHECK_INTERVAL=5s
+      - RUNNER_FAIL_THRESHOLD=3
+      - RUNNER_COOLDOWN=60s
+    depends_on:
+      rules-db:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr 0.0.0.0:9092
+      - --advertise-kafka-addr redpanda:9092
+    ports:
+      - "9092:9092"   # Kafka API
+      - "9644:9644"   # Admin HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info -X brokers=redpanda:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8086:8080"   # Console UI
+
+  kafka-init:
+    image: redpandadata/redpanda:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh","-c"]
+    command: >-
+      "rpk topic create alert.raised incident.opened action.requested action.completed action.failed \
+      -X brokers=redpanda:9092 || true"
+
+  # Incident Store API service
+  incident-api:
+    build:
+      context: .
+      dockerfile: cmd/incident-api/Dockerfile
+    environment:
+      - INCIDENT_DB_DSN=postgres://incident:incident@incident-db:5432/incident?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_INCIDENT_OPENED=incident.opened
+      - KAFKA_TOPIC_ACTION_COMPLETED=action.completed
+      - KAFKA_TOPIC_ACTION_FAILED=action.failed
+    ports:
+      - "8091:8091"
+    depends_on:
+      incident-db:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8091/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Action Runner services (two instances for recovery scenario)
+  action-runner-a:
+    build:
+      context: .
+      dockerfile: cmd/action-runner/Dockerfile
+    environment:
+      - ACTION_DB_DSN=postgres://action:action@action-db:5432/action?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
+      - KAFKA_TOPIC_ACTION_COMPLETED=action.completed
+      - KAFKA_TOPIC_ACTION_FAILED=action.failed
+      - HEALTH_URL=http://app:8080/healthz
+      - DOCKER_IMAGE=eventpulse-app:latest
+      - DOCKER_NETWORK=eventpulse_default
+    depends_on:
+      action-db:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8092/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  action-runner-b:
+    build:
+      context: .
+      dockerfile: cmd/action-runner/Dockerfile
+    environment:
+      - ACTION_DB_DSN=postgres://action:action@action-db:5432/action?sslmode=disable
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
+      - KAFKA_TOPIC_ACTION_COMPLETED=action.completed
+      - KAFKA_TOPIC_ACTION_FAILED=action.failed
+      - HEALTH_URL=http://app:8080/healthz
+      - DOCKER_IMAGE=eventpulse-app:latest
+      - DOCKER_NETWORK=eventpulse_default
+    depends_on:
+      action-db:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8092/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  ingest-db-data:
+  rules-db-data:
+  action-db-data:
+  incident-db-data:
