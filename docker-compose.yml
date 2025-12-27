@@ -171,6 +171,10 @@ services:
       - KAFKA_TOPIC_ALERT_RAISED=alert.raised
       - KAFKA_TOPIC_INCIDENT_OPENED=incident.opened
       - KAFKA_TOPIC_ACTION_REQUESTED=action.requested
+      - RUNNER_SERVICES=action-runner-a,action-runner-b
+      - RUNNER_CHECK_INTERVAL=5s
+      - RUNNER_FAIL_THRESHOLD=3
+      - RUNNER_COOLDOWN=60s
     depends_on:
       rules-db:
         condition: service_healthy

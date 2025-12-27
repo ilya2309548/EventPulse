@@ -195,6 +195,62 @@ func (r *Runner) removeContainer(ctx context.Context, id string) error {
 	return nil
 }
 
+// executeRestartRunner starts a stopped runner container by its compose service name (e.g. "action-runner-a").
+// It finds the container by label com.docker.compose.service and calls `docker start`.
+// Optionally waits for the runner's health endpoint to respond.
+func (r *Runner) executeRestartRunner(targetService string) error {
+	svc := strings.TrimSpace(targetService)
+	if svc == "" {
+		return errors.New("target_runner is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Find container id by compose service label
+	find := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", fmt.Sprintf("label=com.docker.compose.service=%s", svc))
+	var out bytes.Buffer
+	find.Stdout = &out
+	if err := find.Run(); err != nil {
+		return fmt.Errorf("docker ps failed: %v", err)
+	}
+	id := strings.TrimSpace(out.String())
+	if id == "" {
+		return fmt.Errorf("container for service %s not found", svc)
+	}
+
+	// If already running, treat as success
+	inspect := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", id)
+	var inspOut bytes.Buffer
+	inspect.Stdout = &inspOut
+	_ = inspect.Run()
+	if strings.Contains(strings.ToLower(inspOut.String()), "true") {
+		return nil
+	}
+
+	// Start container
+	start := exec.CommandContext(ctx, "docker", "start", id)
+	var startOut bytes.Buffer
+	start.Stdout = &startOut
+	start.Stderr = &startOut
+	if err := start.Run(); err != nil {
+		return fmt.Errorf("docker start failed: %s", startOut.String())
+	}
+
+	// Best-effort readiness probe against runner health
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := fmt.Sprintf("http://%s:8092/health", svc)
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil && resp.StatusCode == 200 {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	// If health didn't come up within deadline, still return success (container started)
+	return nil
+}
+
 func (r *Runner) executeScale(kind string, desired int) error {
 	if strings.ToLower(kind) != "scale_docker" {
 		return fmt.Errorf("unsupported action kind: %s", kind)
@@ -281,25 +337,36 @@ func (r *Runner) processAction(msg kafka.Message) error {
 		desired = int(v)
 	}
 	alertFP, _ := m["alert_fp"].(string)
+	targetRunner, _ := m["target_runner"].(string)
 
 	// Record start
 	if err := r.recordAction(dedup, kind, desired, alertFP, "running", "", now); err != nil {
 		log.Printf("record action start failed: %v", err)
 	}
 
-	// Execute (stub)
+	// Execute requested action
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := r.executeScale(kind, desired); err != nil {
+	var execErr error
+	switch strings.ToLower(kind) {
+	case "scale_docker":
+		execErr = r.executeScale(kind, desired)
+	case "restart_runner":
+		execErr = r.executeRestartRunner(targetRunner)
+	default:
+		execErr = fmt.Errorf("unsupported action kind: %s", kind)
+	}
+	if execErr != nil {
 		// Failure path
-		_ = r.recordAction(dedup, kind, desired, alertFP, "failed", err.Error(), now)
+		_ = r.recordAction(dedup, kind, desired, alertFP, "failed", execErr.Error(), now)
 		payload := map[string]any{
 			"type":             "action.failed",
 			"action_id":        dedup,
 			"kind":             kind,
 			"desired_replicas": desired,
 			"alert_fp":         alertFP,
-			"error":            err.Error(),
+			"error":            execErr.Error(),
+			"target_runner":    targetRunner,
 			"created_at":       now,
 			"dedup_key":        dedup + ":failed",
 		}
@@ -317,6 +384,7 @@ func (r *Runner) processAction(msg kafka.Message) error {
 		"kind":             kind,
 		"desired_replicas": desired,
 		"alert_fp":         alertFP,
+		"target_runner":    targetRunner,
 		"created_at":       now,
 		"dedup_key":        dedup + ":completed",
 	}

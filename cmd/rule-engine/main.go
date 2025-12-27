@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -193,6 +194,69 @@ func (re *RuleEngine) processAlert(msg kafka.Message) error {
 	return nil
 }
 
+// monitorRunners periodically checks health endpoints of configured runner services.
+// On sustained failure, it emits incident.opened(outage(service)) and action.requested(restart_runner).
+func (re *RuleEngine) monitorRunners(services []string, interval time.Duration, failThreshold int, cooldown time.Duration) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	failCounts := make(map[string]int)
+	lastAction := make(map[string]time.Time)
+	for {
+		for _, svc := range services {
+			svc = strings.TrimSpace(svc)
+			if svc == "" {
+				continue
+			}
+			url := fmt.Sprintf("http://%s:8092/health", svc)
+			ok := false
+			if resp, err := client.Get(url); err == nil && resp.StatusCode == 200 {
+				ok = true
+			}
+			if ok {
+				failCounts[svc] = 0
+				continue
+			}
+			failCounts[svc]++
+			if failCounts[svc] >= failThreshold {
+				// cooldown check
+				if t, ok := lastAction[svc]; ok && time.Since(t) < cooldown {
+					continue
+				}
+				now := time.Now().UTC().Format(time.RFC3339)
+				// incident.opened
+				inc := map[string]any{
+					"type":       "incident.opened",
+					"alert_fp":   fmt.Sprintf("outage(%s)", svc),
+					"created_at": now,
+					"dedup_key":  fmt.Sprintf("%s:%s", svc, "incident.opened"),
+				}
+				// action.requested restart_runner
+				act := map[string]any{
+					"type":          "action.requested",
+					"kind":          "restart_runner",
+					"alert_fp":      fmt.Sprintf("outage(%s)", svc),
+					"target_runner": svc,
+					"created_at":    now,
+					"dedup_key":     fmt.Sprintf("%s:%s", svc, "restart_runner"),
+				}
+				// outbox
+				p1, _ := json.Marshal(inc)
+				p2, _ := json.Marshal(act)
+				_ = writeOutbox(re.db, "incident.opened", string(p1), now)
+				_ = writeOutbox(re.db, "action.requested", string(p2), now)
+				// publish
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = re.incidentWriter.WriteMessages(ctx, kafka.Message{Value: p1})
+				_ = re.actionWriter.WriteMessages(ctx, kafka.Message{Value: p2})
+				cancel()
+				lastAction[svc] = time.Now()
+				// keep counter at threshold to avoid overflow
+				failCounts[svc] = failThreshold
+			}
+		}
+		time.Sleep(interval)
+	}
+}
+
 func main() {
 	common.Init("rule-engine")
 
@@ -247,6 +311,36 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
+
+	// Runner outage monitor (optional, enabled by env)
+	if svcs := strings.TrimSpace(os.Getenv("RUNNER_SERVICES")); svcs != "" {
+		services := []string{}
+		for _, s := range strings.Split(svcs, ",") {
+			if t := strings.TrimSpace(s); t != "" {
+				services = append(services, t)
+			}
+		}
+		interval := 10 * time.Second
+		if v := strings.TrimSpace(os.Getenv("RUNNER_CHECK_INTERVAL")); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				interval = d
+			}
+		}
+		failThreshold := 3
+		if v := strings.TrimSpace(os.Getenv("RUNNER_FAIL_THRESHOLD")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				failThreshold = n
+			}
+		}
+		cooldown := 60 * time.Second
+		if v := strings.TrimSpace(os.Getenv("RUNNER_COOLDOWN")); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				cooldown = d
+			}
+		}
+		log.Printf("runner monitor enabled for %v (interval=%s threshold=%d cooldown=%s)", services, interval, failThreshold, cooldown)
+		go re.monitorRunners(services, interval, failThreshold, cooldown)
+	}
 
 	log.Printf("rule-engine consuming from %s", topicIn)
 	for {
